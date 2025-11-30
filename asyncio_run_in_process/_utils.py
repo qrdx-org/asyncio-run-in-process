@@ -128,6 +128,15 @@ async def _cleanup_tasks(task: 'asyncio.Future[Any]',
             task.cancel()
 
         try:
+            # In Python 3.12+ with uvloop, we need to handle the await more carefully
+            # Check if it's actually a Task or Future that can be awaited
+            if asyncio.iscoroutine(task):
+                # If somehow a coroutine slipped through, create a task
+                task = asyncio.create_task(task)
             await task
         except asyncio.CancelledError:
             pass
+        except TypeError as e:
+            # Handle case where task is not awaitable
+            if "object is not iterable" not in str(e) and "cannot be used in 'await'" not in str(e):
+                raise

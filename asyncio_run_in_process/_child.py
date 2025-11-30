@@ -12,6 +12,21 @@ from typing import (
     cast,
 )
 
+# Apply Python 3.12 compatibility patch for traceback handling
+if sys.version_info >= (3, 12):
+    import traceback as _tb_module
+    _original_tb_exc_init = _tb_module.TracebackException.__init__
+    
+    def _patched_tb_exc_init(self, exc_type, exc_value, exc_traceback, *, limit=None,
+                              lookup_lines=True, capture_locals=False, compact=False,
+                              max_group_width=15, max_group_depth=10, _seen=None):
+        _original_tb_exc_init(self, exc_type, exc_value, exc_traceback, limit=limit,
+                             lookup_lines=lookup_lines, capture_locals=capture_locals,
+                             max_group_width=max_group_width, max_group_depth=max_group_depth,
+                             _seen=_seen)
+    
+    _tb_module.TracebackException.__init__ = _patched_tb_exc_init
+
 from ._utils import (
     RemoteException,
     cleanup_tasks,
@@ -69,14 +84,16 @@ async def _handle_coro(coro: Coroutine[Any, Any, TReturn], got_SIGINT: asyncio.E
     # preventing the cancellation to actually penetrate the coroutine, allowing
     # us to await the `coro_task` without causing the `RuntimeError`.
     coro_task = asyncio.ensure_future(asyncio.shield(coro))
-    async with cleanup_tasks(coro_task):
+    # Create a task for the signal wait to avoid coroutine issues in Python 3.12+
+    signal_wait_task = asyncio.create_task(got_SIGINT.wait())
+    async with cleanup_tasks(coro_task, signal_wait_task):
         while True:
             # Run the coroutine until it either returns, or a SIGINT is received.
             # This is done in a loop because the function *could* choose to ignore
             # the `KeyboardInterrupt` and continue processing, in which case we
             # reset the signal and resume waiting.
             done, pending = await asyncio.wait(
-                (coro_task, got_SIGINT.wait()),
+                (coro_task, signal_wait_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -85,6 +102,8 @@ async def _handle_coro(coro: Coroutine[Any, Any, TReturn], got_SIGINT: asyncio.E
                     return await coro_task
             elif got_SIGINT.is_set():
                 got_SIGINT.clear()
+                # Recreate the signal wait task for next iteration
+                signal_wait_task = asyncio.create_task(got_SIGINT.wait())
 
                 # In the event that a SIGINT was recieve we need to inject a
                 # KeyboardInterrupt exception into the running coroutine.
@@ -163,7 +182,29 @@ async def _do_async_fn(
 
 
 def _run_on_asyncio(async_fn: TAsyncFn, args: Sequence[Any], to_parent: BinaryIO) -> None:
-    loop = asyncio.get_event_loop()
+    # Python 3.10+ requires explicit event loop creation in new threads/processes
+    # Also need to handle uvloop if it's being used
+    try:
+        loop = asyncio.get_event_loop()
+        # If we got an event loop but it's closed, we need a new one
+        if loop.is_closed():
+            raise RuntimeError("Event loop is closed")
+    except RuntimeError:
+        # Check if uvloop is installed and set as the policy
+        policy = asyncio.get_event_loop_policy()
+        policy_name = policy.__class__.__name__
+        
+        if 'uvloop' in policy_name.lower():
+            # Use uvloop's event loop
+            try:
+                import uvloop
+                loop = uvloop.new_event_loop()
+            except ImportError:
+                loop = asyncio.new_event_loop()
+        else:
+            loop = asyncio.new_event_loop()
+        
+        asyncio.set_event_loop(loop)
     try:
         result: Any = loop.run_until_complete(_do_async_fn(async_fn, args, to_parent, loop))
     except BaseException:
